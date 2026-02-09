@@ -1,0 +1,196 @@
+name: FoxPro to C# Migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      migration_id:
+        description: "Unique ID for this migration run"
+        required: true
+        type: string
+      source_repo_url:
+        description: "Source FoxPro repository URL"
+        required: true
+        type: string
+      backend_url:
+        description: "Backend Secret Broker URL"
+        required: true
+        type: string
+        default: "https://migration.phylon.in"
+
+permissions:
+  id-token: write
+  contents: write
+  pull-requests: write
+
+jobs:
+  migrate:
+    name: FoxPro → C# Migration
+    runs-on: ubuntu-latest
+
+    steps:
+    # --------------------------------------------------
+    # Checkout pipeline repository
+    # --------------------------------------------------
+    - name: Checkout pipeline repo
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    # --------------------------------------------------
+    # Runner diagnostics (grouped)
+    # --------------------------------------------------
+    - name: Runner diagnostics
+      run: |
+        echo "::group::Runner diagnostics"
+        echo "Runner: GitHub Hosted"
+        whoami
+        uname -a
+        python3 --version
+        git --version
+        echo "::endgroup::"
+
+    # --------------------------------------------------
+    # Setup Python
+    # --------------------------------------------------
+    - name: Setup Python 3.11
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    # --------------------------------------------------
+    # Install dependencies
+    # --------------------------------------------------
+    - name: Install dependencies
+      run: |
+        echo "::group::Install Python dependencies"
+        python -m pip install --upgrade pip >/dev/null
+        python -m pip install requests >/dev/null
+        echo "✓ Dependencies installed"
+        echo "::endgroup::"
+
+    # --------------------------------------------------
+    # Fetch Secrets from Broker (OIDC)
+    # --------------------------------------------------
+    - name: Fetch Secrets from Broker
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        echo "::group::OIDC authentication"
+
+        OIDC_TOKEN=$(curl -s \
+          -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https://github.com/${{ github.repository_owner }}" \
+          | jq -r '.value')
+
+        if [[ -z "$OIDC_TOKEN" || "$OIDC_TOKEN" == "null" ]]; then
+          echo "❌ Failed to retrieve OIDC token"
+          exit 1
+        fi
+
+        echo "✓ OIDC token retrieved"
+        echo "::endgroup::"
+
+        echo "::group::Fetch secrets from broker"
+
+        curl -sSf -X POST \
+          "${{ inputs.backend_url }}/api/secrets/ci?migration_id=${{ inputs.migration_id }}" \
+          -H "Authorization: Bearer $OIDC_TOKEN" \
+          -o secrets.sh
+
+        source secrets.sh
+
+        if [[ -z "${GROQ_API_KEY:-}" ]]; then
+          echo "❌ GROQ_API_KEY was not injected"
+          exit 1
+        fi
+
+        if [[ -z "${SOURCE_REPO_PAT:-}" ]]; then
+          echo "❌ SOURCE_REPO_PAT was not injected"
+          exit 1
+        fi
+
+        echo "GROQ_API_KEY=${GROQ_API_KEY}" >> "$GITHUB_ENV"
+        echo "SOURCE_REPO_PAT=${SOURCE_REPO_PAT}" >> "$GITHUB_ENV"
+
+        rm -f secrets.sh
+
+        echo "✓ Secrets injected securely"
+        echo "::endgroup::"
+
+    # --------------------------------------------------
+    # Run migration
+    # --------------------------------------------------
+    - name: Run Migration Script
+      env:
+        SOURCE_REPO_URL: ${{ inputs.source_repo_url }}
+      run: |
+        echo "::group::Run FoxPro → C# migration"
+        python scripts/migrate.py
+        echo "✓ Migration completed"
+        echo "::endgroup::"
+
+    # --------------------------------------------------
+    # Commit & push results
+    # --------------------------------------------------
+    - name: Commit and Push Results
+      run: |
+        echo "::group::Commit & push results"
+
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+        git checkout -B migrated-dotnet
+
+        if [[ ! -d "dotnet_out" ]]; then
+          echo "⚠ dotnet_out directory not found — nothing to commit"
+          exit 0
+        fi
+
+        git add dotnet_out
+        git commit -m "FoxPro to C# Migration (ID: ${{ inputs.migration_id }})" || echo "No changes to commit"
+
+        git push \
+          https://${SOURCE_REPO_PAT}@github.com/${{ github.repository }}.git \
+          migrated-dotnet --force
+
+        echo "✓ Changes pushed"
+        echo "::endgroup::"
+
+    # --------------------------------------------------
+    # Create Pull Request
+    # --------------------------------------------------
+    - name: Create Pull Request
+      uses: actions/github-script@v7
+      continue-on-error: true
+      with:
+        github-token: ${{ env.SOURCE_REPO_PAT }}
+        script: |
+          const { owner, repo } = context.repo;
+          try {
+            const pr = await github.rest.pulls.create({
+              owner,
+              repo,
+              title: `FoxPro to C# Migration (ID: ${{ inputs.migration_id }})`,
+              head: 'migrated-dotnet',
+              base: 'main',
+              body: 'Automated FoxPro → .NET migration'
+            });
+            console.log('PR created:', pr.data.html_url);
+          } catch (e) {
+            if (e.status === 422) console.log('PR already exists');
+            else throw e;
+          }
+
+    # --------------------------------------------------
+    # Runner cleanup (IMPORTANT)
+    # --------------------------------------------------
+    - name: Runner cleanup
+      if: always()
+      run: |
+        echo "::group::Runner cleanup"
+        rm -rf dotnet_out || true
+        rm -rf ~/.cache/pip || true
+        git clean -fdx || true
+        echo "✓ Runner cleaned"
+        echo "::endgroup::"
